@@ -26,7 +26,10 @@ import { Plus, Pencil } from 'lucide-react';
 export default function App() {
   const { isAuthenticated, logout } = useAuth();
   if (!isAuthenticated) return <LoginPage />;
+  return <AppContent logout={logout} />;
+}
 
+function AppContent({ logout }) {
   const [activeTab, setActiveTab] = useState('Dashboard');
   const [showModal, setShowModal] = useState(false);
   const [editingTx, setEditingTx] = useState(null);
