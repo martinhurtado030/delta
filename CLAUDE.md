@@ -232,5 +232,201 @@ Labels in UI update dynamically to show the actual period used.
 - [ ] Watchlist — seguimiento de acciones que no están en portafolio, con alertas opcionales
 - [x] Simulador "¿Qué hubiera pasado si...?" — ingresar ticker + monto + fecha hipotética, ver resultado hoy
 - [ ] Reporte de Impuestos — resumen anual de ventas realizadas, ganancia/pérdida neta, IGC estimado Chile
-- [ ] Deploy público — Railway (backend Node+Python) + Vercel (frontend); cambiar URL base en `client/src/utils/api.js` a variable de entorno `VITE_API_URL`; luego agregar PWA encima (manifest.json + vite-plugin-pwa) para que cualquiera pueda instalarla como app en celular/escritorio
+- [ ] Deploy público — ver sección "Deploy Guide" más abajo
 - [ ] Calendario de Dividendos — fechas ex-div y pago de empresas IPSA, yield on cost por posición
+
+## Deploy Guide (Render + Vercel)
+
+### Contexto
+El código corre actualmente **solo local con localStorage** (sin auth, sin DB).
+Los archivos del sistema de deploy YA EXISTEN en el repo pero están desconectados:
+- `server/auth.js` — registro/login con JWT + bcrypt
+- `server/db.js` — conexión PostgreSQL (Supabase)
+- `client/src/components/auth/LoginPage.jsx` — UI de login/registro
+- `client/src/context/AuthContext.jsx` — contexto de autenticación
+- `nixpacks.toml` — config para que Render instale Python + Node juntos
+- `render.yaml` — config del servicio en Render
+
+### Infraestructura ya configurada
+- **Render** (backend): `https://delta-slet.onrender.com` — servicio "delta", plan Free
+- **Vercel** (frontend): `https://delta-tau-two.vercel.app` — proyecto "delta"
+- **Supabase** (DB): tablas `users` y `portfolios` ya creadas con datos del usuario
+
+### Variables de entorno ya configuradas
+**En Render** (Environment → Edit):
+| Key | Estado |
+|-----|--------|
+| `DATABASE_URL` | ✅ configurado (apunta a Supabase) |
+| `JWT_SECRET` | ✅ configurado |
+| `NODE_ENV` | ✅ `production` |
+| `ALLOWED_ORIGINS` | ✅ `https://delta-tau-two.vercel.app` |
+
+**En Vercel** (Settings → Environment Variables):
+| Key | Estado |
+|-----|--------|
+| `VITE_API_URL` | ✅ `https://delta-slet.onrender.com` |
+
+---
+
+### Pasos para re-deployar (orden exacto)
+
+#### PASO 1 — Arreglar server/db.js (crítico: evita que el servidor cuelgue)
+En `server/db.js`, el Pool DEBE tener `connectionTimeoutMillis` para que si la DB falla, el servidor igual arranque:
+```js
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : false,
+  connectionTimeoutMillis: 5000,  // ← OBLIGATORIO, sin esto el server cuelga indefinidamente
+});
+```
+
+#### PASO 2 — Arreglar server/auth.js (crítico: evita crashes por event loop bloqueado)
+`bcryptjs` (pure JS) con 12 rounds bloquea el event loop de Node por ~10-20 segundos en el CPU lento de Render free tier → el health check de Render falla → el servidor crashea silenciosamente.
+
+**Fix**: bajar de 12 a 10 rounds en `server/auth.js`:
+```js
+const hash = await bcrypt.hash(password, 10);  // era 12, bajar a 10
+```
+⚠️ Los usuarios registrados con 12 rounds seguirán funcionando (bcrypt.compare detecta los rounds del hash automáticamente). Solo los nuevos registros usarán 10 rounds.
+
+#### PASO 3 — Reconectar server.js
+Agregar imports al inicio:
+```js
+import { initDB, query } from './server/db.js';
+import { register, login, requireAuth } from './server/auth.js';
+```
+
+Agregar rutas (antes del bloque de static files):
+```js
+// Auth
+app.post('/auth/register', register);
+app.post('/auth/login', login);
+
+// Portfolio (JWT protegido)
+app.get('/api/portfolio', requireAuth, async (req, res) => { ... });
+app.post('/api/portfolio', requireAuth, async (req, res) => { ... });
+app.put('/api/portfolio/:id', requireAuth, async (req, res) => { ... });
+app.delete('/api/portfolio/:id', requireAuth, async (req, res) => { ... });
+```
+Ver commit `f0c01c0` en git para el código completo de estas rutas.
+
+Cambiar el startup al final del archivo (cache pre-warming DEBE ser secuencial, no paralelo):
+```js
+initDB()
+  .then(() => {
+    app.listen(PORT, () => {
+      console.log(`DELTA API server running on http://localhost:${PORT}`);
+      // PRE-WARMING SECUENCIAL — crítico en Render free tier (512MB RAM)
+      // NO usar Promise.all ni llamadas paralelas: causa OOM y crash silencioso
+      (async () => {
+        await batchQuotes(IPSA_SYMBOLS);    console.log('[cache] IPSA quotes ready');
+        await batchQuotes(FX_SYMBOLS);      console.log('[cache] FX ready');
+        await batchQuotes(COMMODITY_SYMBOLS); console.log('[cache] Commodities ready');
+        await batchQuotes(INDEX_SYMBOLS);   console.log('[cache] Global indices ready');
+      })();
+    });
+  })
+  .catch(err => {
+    console.error('[fatal] DB init failed:', err.message);
+    app.listen(PORT, () => console.log(`DELTA API running (no DB) on port ${PORT}`));
+  });
+```
+
+#### PASO 4 — Reconectar frontend
+
+**`client/src/utils/api.js`** — agregar timeout 60s y funciones auth:
+```js
+const api = axios.create({ baseURL: BASE_URL + '/api', timeout: 60000 }); // 60s para cold start
+
+// Interceptor JWT
+api.interceptors.request.use((config) => {
+  const token = localStorage.getItem('delta_token');
+  if (token) config.headers.Authorization = `Bearer ${token}`;
+  return config;
+});
+
+// Auto-logout en 401
+api.interceptors.response.use(
+  (response) => response,
+  (error) => {
+    if (error.response?.status === 401 && !error.config.url.includes('/auth/')) {
+      localStorage.removeItem('delta_token');
+      localStorage.removeItem('delta_user');
+      window.location.reload();
+    }
+    return Promise.reject(error);
+  }
+);
+
+const authApi = axios.create({ baseURL: BASE_URL, timeout: 60000 });
+
+export const authLogin    = (email, password) => authApi.post('/auth/login',    { email, password }).then(r => r.data);
+export const authRegister = (email, password) => authApi.post('/auth/register', { email, password }).then(r => r.data);
+export const portfolioGetAll  = () => api.get('/portfolio').then(r => r.data);
+export const portfolioSave    = (id, name, data) => api.put(`/portfolio/${id}`, { name, data }).then(r => r.data);
+export const portfolioCreate  = (id, name) => api.post('/portfolio', { id, name }).then(r => r.data);
+export const portfolioDelete  = (id) => api.delete(`/portfolio/${id}`).then(r => r.data);
+```
+
+**`client/src/main.jsx`** — envolver con AuthProvider:
+```jsx
+import { AuthProvider } from './context/AuthContext.jsx';
+// ...
+<AuthProvider><App /></AuthProvider>
+```
+
+**`client/src/App.jsx`** — agregar gate de login:
+```jsx
+import { useAuth } from './context/AuthContext.jsx';
+import LoginPage from './components/auth/LoginPage.jsx';
+
+export default function App() {
+  const { isAuthenticated, logout } = useAuth();
+  if (!isAuthenticated) return <LoginPage />;
+  return <AppContent logout={logout} />;
+}
+function AppContent({ logout }) { ... }
+```
+
+**`client/src/hooks/usePortfolio.js`** — reemplazar cuerpo por versión con API (ver commit `f0c01c0`). Cambios clave: usar `portfolioGetAll` en lugar de localStorage, `persist` llama a `portfolioSave`, `createPortfolio` llama a `portfolioCreate`, etc.
+
+#### PASO 5 — Push y verificar
+```bash
+git add -A
+git commit -m "feat: restore auth/DB deploy system"
+git push
+```
+Render y Vercel redeploy automáticamente. Verificar en **Render → Logs**:
+- ✅ `[db] Tables ready` — DB conectó
+- ✅ `[cache] IPSA quotes ready` — Python funciona
+- ✅ `Your service is live` — servidor arrancó
+
+---
+
+### Problemas críticos encontrados y sus causas raíz
+
+#### ❌ Servidor crashea silenciosamente cada 2-4 minutos (OOM)
+**Causa**: 4 llamadas a `batchQuotes()` en paralelo al arrancar → 4 procesos Python simultáneos → pandas+yfinance × 4 supera los 512MB RAM del free tier → Render mata el proceso sin mostrar error en logs.
+**Fix**: Pre-warming **secuencial** con `await` (ver Paso 3).
+
+#### ❌ "Error de conexión" en login (servidor no responde)
+**Causa principal**: `bcryptjs` con 12 rounds bloquea el event loop de Node.js por 10-20 segundos en el CPU lento de Render. Durante ese tiempo, el health check de Render falla → restart del servidor → la respuesta al login nunca llega.
+**Fix**: Bajar a 10 rounds (ver Paso 2). Alternativa: migrar a `bcrypt` (nativo, usa thread pool, no bloquea event loop).
+
+#### ❌ 502 al inicio aunque DB esté bien configurada
+**Causa**: `new Pool({ connectionString: undefined })` sin `connectionTimeoutMillis` → pg intenta conectar indefinidamente → `initDB()` nunca resuelve ni rechaza → `app.listen()` nunca se llama → Render ve el puerto sin responder → 502.
+**Fix**: `connectionTimeoutMillis: 5000` en el Pool (ver Paso 1).
+
+#### ❌ Cold start lento (50+ segundos de 502)
+**Causa**: Render free tier apaga el servidor tras 15 min sin tráfico. El axios timeout de 15s era menor que el tiempo de arranque.
+**Fix**: Timeout de 60s en Axios. No se puede eliminar en plan gratuito; upgrade a plan Starter ($7/mes) elimina el sleep.
+
+#### ❌ Login falla solo desde Vercel, no desde Render directo
+**Causa**: CORS — el frontend en Vercel tiene origen diferente al backend en Render. `ALLOWED_ORIGINS` debe incluir exactamente la URL de Vercel (sin trailing slash, con https).
+**Fix**: `ALLOWED_ORIGINS=https://delta-tau-two.vercel.app` en Render.
+
+### Migración de datos localStorage → Supabase
+Al registrarse en producción, el portafolio empieza vacío. Para migrar posiciones:
+1. Abrir localhost:5173 en el navegador local
+2. DevTools → Console: `copy(localStorage.getItem('delta_portfolios_v1'))`
+3. Pegar el JSON en Supabase → tabla `portfolios` → campo `data` del registro del usuario
