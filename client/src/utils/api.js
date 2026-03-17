@@ -2,7 +2,7 @@ import axios from 'axios';
 
 const BASE_URL = import.meta.env.VITE_API_URL ?? '';
 
-const api = axios.create({ baseURL: BASE_URL + '/api', timeout: 15000 });
+const api = axios.create({ baseURL: BASE_URL + '/api', timeout: 60000 });
 
 // Attach JWT token on every request
 api.interceptors.request.use((config) => {
@@ -26,7 +26,7 @@ api.interceptors.response.use(
 );
 
 // Separate instance for auth (no /api prefix)
-const authApi = axios.create({ baseURL: BASE_URL, timeout: 15000 });
+const authApi = axios.create({ baseURL: BASE_URL, timeout: 60000 });
 
 export const authLogin    = (email, password) =>
   authApi.post('/auth/login',    { email, password }).then(r => r.data);
