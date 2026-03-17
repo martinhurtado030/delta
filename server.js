@@ -662,13 +662,13 @@ initDB()
       console.log(`DELTA API server running on http://localhost:${PORT}`);
       console.log(`  Test: http://localhost:${PORT}/api/test`);
 
-      // Pre-warm caches in background for fast first load
-      setTimeout(() => {
-        batchQuotes(IPSA_SYMBOLS).then(() => console.log('[cache] IPSA quotes ready'));
-        batchQuotes(FX_SYMBOLS).then(() => console.log('[cache] FX ready'));
-        batchQuotes(COMMODITY_SYMBOLS).then(() => console.log('[cache] Commodities ready'));
-        batchQuotes(INDEX_SYMBOLS).then(() => console.log('[cache] Global indices ready'));
-      }, 500);
+      // Pre-warm caches sequentially to avoid OOM on free tier
+      (async () => {
+        await batchQuotes(IPSA_SYMBOLS);    console.log('[cache] IPSA quotes ready');
+        await batchQuotes(FX_SYMBOLS);      console.log('[cache] FX ready');
+        await batchQuotes(COMMODITY_SYMBOLS); console.log('[cache] Commodities ready');
+        await batchQuotes(INDEX_SYMBOLS);   console.log('[cache] Global indices ready');
+      })();
     });
   })
   .catch(err => {
