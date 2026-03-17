@@ -1,6 +1,4 @@
 import React, { useState, useMemo, useCallback } from 'react';
-import { useAuth } from './context/AuthContext.jsx';
-import LoginPage from './components/auth/LoginPage.jsx';
 import Header from './components/layout/Header';
 import SummaryCards from './components/portfolio/SummaryCards';
 import PortfolioTable from './components/portfolio/PortfolioTable';
@@ -24,12 +22,6 @@ import StockDetailView from './components/analysis/StockDetailView';
 import { Plus, Pencil } from 'lucide-react';
 
 export default function App() {
-  const { isAuthenticated, logout } = useAuth();
-  if (!isAuthenticated) return <LoginPage />;
-  return <AppContent logout={logout} />;
-}
-
-function AppContent({ logout }) {
   const [activeTab, setActiveTab] = useState('Dashboard');
   const [showModal, setShowModal] = useState(false);
   const [editingTx, setEditingTx] = useState(null);
@@ -88,7 +80,6 @@ function AppContent({ logout }) {
         onCreatePortfolio={createPortfolio}
         onRenamePortfolio={renamePortfolio}
         onDeletePortfolio={deletePortfolio}
-        onLogout={logout}
       />
 
       <main style={{ maxWidth: 1400, margin: '0 auto', padding: '28px 24px' }}>

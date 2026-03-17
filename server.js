@@ -6,8 +6,6 @@ import { fileURLToPath } from 'url';
 import axios from 'axios';
 import { spawn } from 'child_process';
 import fs from 'fs';
-import { initDB, query } from './server/db.js';
-import { register, login, requireAuth } from './server/auth.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -572,80 +570,6 @@ app.get('/api/news', async (_req, res) => {
   }
 });
 
-// ── Auth routes ───────────────────────────────────────────────────────────────
-app.post('/auth/register', register);
-app.post('/auth/login',    login);
-
-// ── Portfolio routes (per-user, JWT protected) ────────────────────────────────
-app.get('/api/portfolio', requireAuth, async (req, res) => {
-  try {
-    const result = await query(
-      'SELECT id, name, data FROM portfolios WHERE user_id = $1 ORDER BY created_at ASC',
-      [req.user.id]
-    );
-    res.json(result.rows);
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-app.post('/api/portfolio', requireAuth, async (req, res) => {
-  const { id, name } = req.body;
-  if (!id || !name) return res.status(400).json({ error: 'id y name requeridos' });
-  try {
-    await query(
-      'INSERT INTO portfolios (id, user_id, name, data) VALUES ($1, $2, $3, $4)',
-      [id, req.user.id, name,
-       JSON.stringify({ positions: [], transactions: [], dividends: [], cashReserve: 0 })]
-    );
-    res.status(201).json({ ok: true });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-app.put('/api/portfolio/:id', requireAuth, async (req, res) => {
-  const { name, data } = req.body;
-  try {
-    const existing = await query(
-      'SELECT id FROM portfolios WHERE id = $1 AND user_id = $2',
-      [req.params.id, req.user.id]
-    );
-    if (existing.rows.length === 0) {
-      await query(
-        'INSERT INTO portfolios (id, user_id, name, data) VALUES ($1, $2, $3, $4)',
-        [req.params.id, req.user.id, name || 'Portafolio', JSON.stringify(data || {})]
-      );
-    } else {
-      await query(
-        'UPDATE portfolios SET name = $1, data = $2, updated_at = NOW() WHERE id = $3 AND user_id = $4',
-        [name, JSON.stringify(data), req.params.id, req.user.id]
-      );
-    }
-    res.json({ ok: true });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-app.delete('/api/portfolio/:id', requireAuth, async (req, res) => {
-  try {
-    const countResult = await query(
-      'SELECT COUNT(*) FROM portfolios WHERE user_id = $1',
-      [req.user.id]
-    );
-    if (parseInt(countResult.rows[0].count) <= 1) {
-      return res.status(400).json({ error: 'Debe quedar al menos un portafolio' });
-    }
-    await query(
-      'DELETE FROM portfolios WHERE id = $1 AND user_id = $2',
-      [req.params.id, req.user.id]
-    );
-    res.json({ ok: true });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
 
 // Production static
 const clientDist = path.join(__dirname, 'client', 'dist');
@@ -656,25 +580,14 @@ app.get('*', (_req, res) => {
 
 const PORT = process.env.PORT || 3001;
 
-initDB()
-  .then(() => {
-    app.listen(PORT, () => {
-      console.log(`DELTA API server running on http://localhost:${PORT}`);
-      console.log(`  Test: http://localhost:${PORT}/api/test`);
+app.listen(PORT, () => {
+  console.log(`DELTA API server running on http://localhost:${PORT}`);
 
-      // Pre-warm caches sequentially to avoid OOM on free tier
-      (async () => {
-        await batchQuotes(IPSA_SYMBOLS);    console.log('[cache] IPSA quotes ready');
-        await batchQuotes(FX_SYMBOLS);      console.log('[cache] FX ready');
-        await batchQuotes(COMMODITY_SYMBOLS); console.log('[cache] Commodities ready');
-        await batchQuotes(INDEX_SYMBOLS);   console.log('[cache] Global indices ready');
-      })();
-    });
-  })
-  .catch(err => {
-    console.error('[fatal] DB init failed:', err.message);
-    console.warn('[warn] Running without database — auth/portfolio routes unavailable');
-    app.listen(PORT, () => {
-      console.log(`DELTA API server running (no DB) on http://localhost:${PORT}`);
-    });
-  });
+  // Pre-warm caches in background
+  setTimeout(() => {
+    batchQuotes(IPSA_SYMBOLS).then(() => console.log('[cache] IPSA quotes ready'));
+    batchQuotes(FX_SYMBOLS).then(() => console.log('[cache] FX ready'));
+    batchQuotes(COMMODITY_SYMBOLS).then(() => console.log('[cache] Commodities ready'));
+    batchQuotes(INDEX_SYMBOLS).then(() => console.log('[cache] Global indices ready'));
+  }, 500);
+});

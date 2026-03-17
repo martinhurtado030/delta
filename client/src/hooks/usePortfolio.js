@@ -1,6 +1,8 @@
-import { useState, useEffect, useCallback, useRef } from 'react';
-import { fetchQuotes, portfolioGetAll, portfolioSave, portfolioCreate, portfolioDelete } from '../utils/api';
-import { useAuth } from '../context/AuthContext.jsx';
+import { useState, useEffect, useCallback } from 'react';
+import { fetchQuotes } from '../utils/api';
+
+const STORAGE_KEY = 'delta_portfolios_v1';
+const LEGACY_KEY  = 'delta_portfolio_v2';
 
 const emptyPortfolio = (id, name) => ({
   id,
@@ -11,169 +13,81 @@ const emptyPortfolio = (id, name) => ({
   dividends:    [],
 });
 
-export function usePortfolio() {
-  const { token } = useAuth();
+function loadFromStorage() {
+  try {
+    const raw = localStorage.getItem(STORAGE_KEY);
+    if (raw) return JSON.parse(raw);
+    // Migrate from legacy single-portfolio format
+    const legacy = localStorage.getItem(LEGACY_KEY);
+    if (legacy) {
+      const d = JSON.parse(legacy);
+      const migrated = {
+        activeId: 'p1',
+        portfolios: { p1: { id: 'p1', name: 'Principal', ...d } },
+      };
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(migrated));
+      return migrated;
+    }
+  } catch (_) {}
+  return { activeId: 'p1', portfolios: { p1: emptyPortfolio('p1', 'Principal') } };
+}
 
-  const [state,       setState]       = useState({ activeId: null, portfolios: {}, loading: true });
+function saveToStorage(state) {
+  try { localStorage.setItem(STORAGE_KEY, JSON.stringify(state)); } catch (_) {}
+}
+
+export function usePortfolio() {
+  const [state,       setState]       = useState(loadFromStorage);
   const [quotes,      setQuotes]      = useState({});
   const [loading,     setLoading]     = useState(false);
   const [lastUpdated, setLastUpdated] = useState(null);
 
-  // ── Load portfolios from backend on login ────────────────────────────────────
-  useEffect(() => {
-    if (!token) {
-      setState({ activeId: null, portfolios: {}, loading: false });
-      setQuotes({});
-      return;
-    }
-    setState(s => ({ ...s, loading: true }));
-    portfolioGetAll()
-      .then(rows => {
-        const portfolios = {};
-        rows.forEach(row => {
-          portfolios[row.id] = {
-            id:           row.id,
-            name:         row.name,
-            positions:    row.data.positions    ?? [],
-            transactions: row.data.transactions ?? [],
-            dividends:    row.data.dividends    ?? [],
-            cashReserve:  row.data.cashReserve  ?? 0,
-          };
-        });
-        const firstId = rows[0]?.id ?? null;
-        setState({ activeId: firstId, portfolios, loading: false });
-      })
-      .catch(err => {
-        console.error('[portfolio] load failed:', err);
-        setState({ activeId: null, portfolios: {}, loading: false });
-      });
-  }, [token]);
-
-  // ── Persist to backend (non-blocking) ───────────────────────────────────────
-  const syncQueue = useRef({});
-  const syncTimers = useRef({});
-
-  const persist = useCallback((next) => {
-    setState(next);
-    // Debounce sync per portfolio — avoid hammering the API on fast edits
-    const activePortfolio = next.portfolios[next.activeId];
-    if (!activePortfolio) return;
-    const id = next.activeId;
-    if (syncTimers.current[id]) clearTimeout(syncTimers.current[id]);
-    syncQueue.current[id] = activePortfolio;
-    syncTimers.current[id] = setTimeout(async () => {
-      const p = syncQueue.current[id];
-      if (!p) return;
-      try {
-        await portfolioSave(id, p.name, {
-          positions:    p.positions,
-          transactions: p.transactions,
-          dividends:    p.dividends,
-          cashReserve:  p.cashReserve,
-        });
-      } catch (err) {
-        console.error('[portfolio] sync failed:', err);
-      }
-    }, 800);
-  }, []);
-
-  // Active portfolio object
   const portfolio = state.portfolios[state.activeId] ?? emptyPortfolio(state.activeId ?? 'p1', 'Portafolio');
 
-  // ── Portfolio management ─────────────────────────────────────────────────────
+  const persist = useCallback((next) => {
+    const resolved = typeof next === 'function' ? next(state) : next;
+    setState(resolved);
+    saveToStorage(resolved);
+  }, [state]);
 
-  const createPortfolio = useCallback(async (name) => {
+  // ── Portfolio management ──────────────────────────────────────────────────────
+
+  const createPortfolio = useCallback((name) => {
     const id = `p${Date.now()}`;
-    try {
-      await portfolioCreate(id, name.trim() || 'Nuevo Portafolio');
-      setState(s => ({
-        ...s,
-        activeId: id,
-        portfolios: { ...s.portfolios, [id]: emptyPortfolio(id, name.trim() || 'Nuevo Portafolio') },
-      }));
-    } catch (err) {
-      console.error('[portfolio] create failed:', err);
-    }
-  }, []);
-
-  const switchPortfolio = useCallback((id) => {
-    setState(s => s.portfolios[id] ? { ...s, activeId: id } : s);
-  }, []);
-
-  const renamePortfolio = useCallback((id, name) => {
-    setState(s => {
-      if (!s.portfolios[id]) return s;
-      const next = {
-        ...s,
-        portfolios: { ...s.portfolios, [id]: { ...s.portfolios[id], name: name.trim() } },
-      };
-      // Sync rename immediately
-      const p = next.portfolios[id];
-      portfolioSave(id, p.name, {
-        positions: p.positions, transactions: p.transactions,
-        dividends: p.dividends, cashReserve: p.cashReserve,
-      }).catch(console.error);
-      return next;
-    });
-  }, []);
-
-  const deletePortfolio = useCallback(async (id) => {
-    if (Object.keys(state.portfolios).length <= 1) return;
-    try {
-      await portfolioDelete(id);
-      setState(s => {
-        const { [id]: _, ...rest } = s.portfolios;
-        const nextActive = s.activeId === id ? Object.keys(rest)[0] : s.activeId;
-        return { ...s, activeId: nextActive, portfolios: rest };
-      });
-    } catch (err) {
-      console.error('[portfolio] delete failed:', err);
-    }
-  }, [state.portfolios]);
-
-  // ── Persist active portfolio changes ────────────────────────────────────────
-
-  const saveActive = useCallback((updated) => {
     persist(s => ({
       ...s,
-      portfolios: { ...s.portfolios, [s.activeId]: updated },
+      activeId: id,
+      portfolios: { ...s.portfolios, [id]: emptyPortfolio(id, name.trim() || 'Nuevo Portafolio') },
     }));
   }, [persist]);
 
-  // Functional form of persist (receives updater fn or next state)
-  const persistFn = useCallback((nextOrFn) => {
-    if (typeof nextOrFn === 'function') {
-      setState(s => {
-        const next = nextOrFn(s);
-        // Trigger sync
-        const activePortfolio = next.portfolios[next.activeId];
-        if (!activePortfolio) return next;
-        const id = next.activeId;
-        if (syncTimers.current[id]) clearTimeout(syncTimers.current[id]);
-        syncQueue.current[id] = activePortfolio;
-        syncTimers.current[id] = setTimeout(async () => {
-          const p = syncQueue.current[id];
-          if (!p) return;
-          try {
-            await portfolioSave(id, p.name, {
-              positions: p.positions, transactions: p.transactions,
-              dividends: p.dividends, cashReserve: p.cashReserve,
-            });
-          } catch (err) {
-            console.error('[portfolio] sync failed:', err);
-          }
-        }, 800);
-        return next;
-      });
-    } else {
-      persist(nextOrFn);
-    }
+  const switchPortfolio = useCallback((id) => {
+    persist(s => s.portfolios[id] ? { ...s, activeId: id } : s);
   }, [persist]);
 
-  // ── Quotes ───────────────────────────────────────────────────────────────────
+  const renamePortfolio = useCallback((id, name) => {
+    persist(s => {
+      if (!s.portfolios[id]) return s;
+      return { ...s, portfolios: { ...s.portfolios, [id]: { ...s.portfolios[id], name: name.trim() } } };
+    });
+  }, [persist]);
+
+  const deletePortfolio = useCallback((id) => {
+    persist(s => {
+      if (Object.keys(s.portfolios).length <= 1) return s;
+      const { [id]: _, ...rest } = s.portfolios;
+      const nextActive = s.activeId === id ? Object.keys(rest)[0] : s.activeId;
+      return { ...s, activeId: nextActive, portfolios: rest };
+    });
+  }, [persist]);
+
+  // ── Quotes ────────────────────────────────────────────────────────────────────
 
   const refreshQuotes = useCallback(async () => {
-    if (portfolio.positions.length === 0) return;
+    if (portfolio.positions.length === 0) {
+      setLastUpdated(new Date());
+      return;
+    }
     setLoading(true);
     try {
       const symbols = [...new Set(portfolio.positions.map(p => p.ticker))];
@@ -199,7 +113,7 @@ export function usePortfolio() {
     return () => clearInterval(interval);
   }, [refreshQuotes]);
 
-  // ── Position operations ──────────────────────────────────────────────────────
+  // ── Position operations ───────────────────────────────────────────────────────
 
   const addPosition = useCallback((position) => {
     const newPosition = {
@@ -218,18 +132,18 @@ export function usePortfolio() {
       price: newPosition.buyPrice, total: newPosition.quantity * newPosition.buyPrice,
       date: newPosition.buyDate,
     };
-    persist({
-      ...state,
+    persist(s => ({
+      ...s,
       portfolios: {
-        ...state.portfolios,
-        [state.activeId]: {
+        ...s.portfolios,
+        [s.activeId]: {
           ...portfolio,
           positions:    [...portfolio.positions, newPosition],
           transactions: [...portfolio.transactions, transaction],
         },
       },
-    });
-  }, [portfolio, state, persist]);
+    }));
+  }, [portfolio, persist]);
 
   const sellPosition = useCallback(({ ticker, quantity, price, date, total, realizedPnL }) => {
     const lots = portfolio.positions
@@ -255,18 +169,18 @@ export function usePortfolio() {
         remaining = 0;
       }
     }
-    persist({
-      ...state,
+    persist(s => ({
+      ...s,
       portfolios: {
-        ...state.portfolios,
-        [state.activeId]: {
+        ...s.portfolios,
+        [s.activeId]: {
           ...portfolio,
           positions:    newPositions,
           transactions: [...portfolio.transactions, transaction],
         },
       },
-    });
-  }, [portfolio, state, persist]);
+    }));
+  }, [portfolio, persist]);
 
   const removeByTicker = useCallback((ticker) => {
     const toRemove = portfolio.positions.filter(p => p.ticker === ticker);
@@ -280,18 +194,18 @@ export function usePortfolio() {
         date: new Date().toISOString().split('T')[0],
       };
     });
-    persist({
-      ...state,
+    persist(s => ({
+      ...s,
       portfolios: {
-        ...state.portfolios,
-        [state.activeId]: {
+        ...s.portfolios,
+        [s.activeId]: {
           ...portfolio,
           positions:    portfolio.positions.filter(p => p.ticker !== ticker),
           transactions: [...portfolio.transactions, ...newTxs],
         },
       },
-    });
-  }, [portfolio, state, quotes, persist]);
+    }));
+  }, [portfolio, quotes, persist]);
 
   const editTransaction = useCallback((transactionId, updates) => {
     const tx = portfolio.transactions.find(t => t.id === transactionId);
@@ -315,14 +229,14 @@ export function usePortfolio() {
         p.id === transactionId ? { ...p, quantity: qty, buyPrice: price, buyDate: date } : p
       );
     }
-    persist({
-      ...state,
+    persist(s => ({
+      ...s,
       portfolios: {
-        ...state.portfolios,
-        [state.activeId]: { ...portfolio, transactions: newTransactions, positions: newPositions },
+        ...s.portfolios,
+        [s.activeId]: { ...portfolio, transactions: newTransactions, positions: newPositions },
       },
-    });
-  }, [portfolio, state, persist]);
+    }));
+  }, [portfolio, persist]);
 
   const deleteTransaction = useCallback((transactionId) => {
     const tx = portfolio.transactions.find(t => t.id === transactionId);
@@ -331,40 +245,40 @@ export function usePortfolio() {
     const newPositions = tx.type === 'BUY'
       ? portfolio.positions.filter(p => p.id !== transactionId)
       : portfolio.positions;
-    persist({
-      ...state,
+    persist(s => ({
+      ...s,
       portfolios: {
-        ...state.portfolios,
-        [state.activeId]: { ...portfolio, transactions: newTransactions, positions: newPositions },
+        ...s.portfolios,
+        [s.activeId]: { ...portfolio, transactions: newTransactions, positions: newPositions },
       },
-    });
-  }, [portfolio, state, persist]);
+    }));
+  }, [portfolio, persist]);
 
   const updateCash = useCallback((amount) => {
-    persist({
-      ...state,
+    persist(s => ({
+      ...s,
       portfolios: {
-        ...state.portfolios,
-        [state.activeId]: { ...portfolio, cashReserve: parseFloat(amount) || 0 },
+        ...s.portfolios,
+        [s.activeId]: { ...portfolio, cashReserve: parseFloat(amount) || 0 },
       },
-    });
-  }, [portfolio, state, persist]);
+    }));
+  }, [portfolio, persist]);
 
   const addDividend = useCallback((dividend) => {
-    persist({
-      ...state,
+    persist(s => ({
+      ...s,
       portfolios: {
-        ...state.portfolios,
-        [state.activeId]: {
+        ...s.portfolios,
+        [s.activeId]: {
           ...portfolio,
           dividends:   [...portfolio.dividends, { id: Date.now().toString(), ...dividend, date: dividend.date || new Date().toISOString().split('T')[0] }],
           cashReserve: portfolio.cashReserve + parseFloat(dividend.amount),
         },
       },
-    });
-  }, [portfolio, state, persist]);
+    }));
+  }, [portfolio, persist]);
 
-  // ── Computed metrics ─────────────────────────────────────────────────────────
+  // ── Computed metrics ──────────────────────────────────────────────────────────
 
   const metrics = (() => {
     let equityValue = 0;
@@ -381,8 +295,8 @@ export function usePortfolio() {
       return { ...pos, quote, currentPrice, currentValue, costBasis, unrealizedPnL, unrealizedPnLPct };
     });
 
-    const totalNav           = equityValue + portfolio.cashReserve;
-    const totalUnrealizedPnL = equityValue - totalCost;
+    const totalNav              = equityValue + portfolio.cashReserve;
+    const totalUnrealizedPnL    = equityValue - totalCost;
     const totalUnrealizedPnLPct = totalCost > 0 ? (totalUnrealizedPnL / totalCost) * 100 : 0;
     const equityPct = totalNav > 0 ? (equityValue / totalNav) * 100 : 0;
     const cashPct   = totalNav > 0 ? (portfolio.cashReserve / totalNav) * 100 : 0;
@@ -425,13 +339,13 @@ export function usePortfolio() {
       if (pos.currentValue != null) g.currentValue = (g.currentValue ?? 0) + pos.currentValue;
     });
     const groupedPositions = Object.values(groupMap).map(g => {
-      const buyPrice      = g.quantity > 0 ? g.totalCost / g.quantity : 0;
-      const unrealizedPnL = g.currentValue != null ? g.currentValue - g.totalCost : null;
+      const buyPrice         = g.quantity > 0 ? g.totalCost / g.quantity : 0;
+      const unrealizedPnL    = g.currentValue != null ? g.currentValue - g.totalCost : null;
       const unrealizedPnLPct = g.totalCost > 0 && unrealizedPnL != null ? (unrealizedPnL / g.totalCost) * 100 : null;
       return { id: g.ticker, ...g, buyPrice, costBasis: g.totalCost, unrealizedPnL, unrealizedPnLPct };
     });
 
-    const sorted  = [...positionsWithData].sort((a, b) => (b.currentValue || 0) - (a.currentValue || 0));
+    const sorted    = [...positionsWithData].sort((a, b) => (b.currentValue || 0) - (a.currentValue || 0));
     const top5Value = sorted.slice(0, 5).reduce((s, p) => s + (p.currentValue || 0), 0);
     const top5Pct   = totalNav > 0 ? (top5Value / totalNav) * 100 : 0;
 
@@ -446,13 +360,10 @@ export function usePortfolio() {
   const portfolioList = Object.values(state.portfolios).map(p => ({ id: p.id, name: p.name }));
 
   return {
-    portfolio, metrics, quotes, loading: loading || state.loading, lastUpdated,
+    portfolio, metrics, quotes, loading, lastUpdated,
     portfolioList,
     activePortfolioId: state.activeId,
-    createPortfolio,
-    switchPortfolio,
-    renamePortfolio,
-    deletePortfolio,
+    createPortfolio, switchPortfolio, renamePortfolio, deletePortfolio,
     addPosition, sellPosition, removeByTicker, editTransaction, deleteTransaction,
     updateCash, addDividend, refreshQuotes,
   };
