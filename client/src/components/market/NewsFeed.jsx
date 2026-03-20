@@ -1,5 +1,5 @@
 import React, { useEffect, useState } from 'react';
-import axios from 'axios';
+import { fetchNews } from '../../utils/api';
 
 const SOURCES = ['Todas', 'IPSA · Bolsa', 'Economía Chile', 'Minería · Cobre', 'BBC Mundo Economía'];
 
@@ -19,8 +19,8 @@ export default function NewsFeed() {
   useEffect(() => {
     setLoading(true);
     setError(false);
-    axios.get('/api/news', { timeout: 12000 })
-      .then(r => { setItems(r.data); })
+    fetchNews()
+      .then(data => { setItems(data); })
       .catch(() => setError(true))
       .finally(() => setLoading(false));
   }, []);

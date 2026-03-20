@@ -1,6 +1,6 @@
 import React, { useEffect, useState } from 'react';
 import { Treemap, ResponsiveContainer, Tooltip } from 'recharts';
-import axios from 'axios';
+import { fetchHeatmap } from '../../utils/api';
 
 const SECTORS = ['Todos', 'Financials', 'Utilities', 'Materials', 'Energy', 'Consumer Discretionary', 'Consumer Staples', 'Industrials', 'Real Estate', 'Technology'];
 
@@ -121,7 +121,7 @@ export default function MarketHeatmap() {
   const [sector, setSector]   = useState('Todos');
 
   useEffect(() => {
-    axios.get('/api/heatmap').then(r => setRaw(r.data)).catch(() => {}).finally(() => setLoading(false));
+    fetchHeatmap().then(setRaw).catch(() => {}).finally(() => setLoading(false));
   }, []);
 
   const data = (sector === 'Todos' ? raw : raw.filter(d => d.sector === sector))

@@ -82,9 +82,9 @@ export default function App() {
         onDeletePortfolio={deletePortfolio}
       />
 
-      <main style={{ maxWidth: 1400, margin: '0 auto', padding: '28px 24px' }}>
+      <main className="main-content" style={{ maxWidth: 1400, margin: '0 auto', padding: '28px 24px' }}>
         {/* Action bar */}
-        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 24 }}>
+        <div className="action-bar" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 24 }}>
           <div>
             <h1 style={{ fontSize: 22, fontWeight: 700, color: '#e2e8f0' }}>
               {activeTab === 'Dashboard' && 'Panel Principal'}
@@ -108,11 +108,11 @@ export default function App() {
         {activeTab === 'Dashboard' && (
           <div style={{ display: 'flex', flexDirection: 'column', gap: 20 }}>
             <SummaryCards metrics={{ ...metrics, portfolio }} />
-            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 20 }}>
+            <div className="grid-cols-2">
               <PortfolioChart positions={groupedPositions} />
               <PerformanceChart />
             </div>
-            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 20 }}>
+            <div className="grid-cols-2">
               <AllocationChart metrics={{ ...metrics, portfolio }} />
               <TopPerformers />
             </div>

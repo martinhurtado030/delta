@@ -39,3 +39,9 @@ export const fetchTopPerformers = () =>
 
 export const fetchSimulate = (symbol, startDate) =>
   api.get(`/simulate?symbol=${encodeURIComponent(symbol)}&startDate=${startDate}`).then(r => r.data);
+
+export const fetchHeatmap = () =>
+  api.get('/heatmap').then(r => r.data);
+
+export const fetchNews = () =>
+  api.get('/news', { timeout: 20000 }).then(r => r.data);

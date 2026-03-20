@@ -30,11 +30,17 @@ export default function PortfolioChart({ positions }) {
   const [chartData, setChartData] = useState([]);
   const [loading, setLoading]     = useState(false);
 
+  // effectKey changes when: tickers change, period changes, or quotes go from absent→present.
+  // This means the chart fetches at most twice on initial load (once before quotes, once after),
+  // then stays stable through subsequent 60s quote refreshes.
+  const tickerKey = positions.map(p => p.ticker).sort().join(',');
+  const hasQuotes = positions.some(p => p.quote != null);
+  const effectKey = `${tickerKey}::${hasQuotes}`;
+
   const weightedTickers = useMemo(() => {
     const map = {};
     positions.forEach(p => {
       if (!map[p.ticker]) map[p.ticker] = 0;
-      // Use current market value as weight; fall back to cost basis if quotes not loaded
       map[p.ticker] += p.currentValue ?? (p.quantity * p.buyPrice);
     });
     const totalValue = Object.values(map).reduce((s, v) => s + v, 0);
@@ -42,7 +48,8 @@ export default function PortfolioChart({ positions }) {
       ticker,
       weight: totalValue > 0 ? value / totalValue : 0,
     }));
-  }, [positions]);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [effectKey]);
 
   useEffect(() => {
     if (weightedTickers.length === 0) return;
@@ -63,17 +70,33 @@ export default function PortfolioChart({ positions }) {
           tickerHistories[i]?.forEach(d => { priceMaps[ticker][d.date] = d.close; });
         });
 
-        // Compound daily returns so new positions entering mid-period don't cause jumps.
-        // Each position contributes its daily % change only on days it has a prior price.
         const prevPrice = {};
 
-        // For intraday (1D/1S), seed prevPrice with previous close so the first candle
-        // captures the gap from yesterday's close — aligning with regularMarketChangePercent.
+        // For intraday periods, seed prevPrice with previous close so the first candle
+        // captures the gap from yesterday's close.
         if (selected.interval === '5m' || selected.interval === '1h') {
           weightedTickers.forEach(({ ticker }) => {
             const pos = positions.find(p => p.ticker === ticker);
             const pc = pos?.quote?.regularMarketPreviousClose;
             if (pc != null) prevPrice[ticker] = pc;
+          });
+
+          // For tickers with sparse or missing intraday candles (< 5), inject synthetic
+          // prices using regularMarketChangePercent spread linearly across IPSA timestamps.
+          // This prevents low-liquidity stocks from being silently excluded from the chart,
+          // which would cause the portfolio return to diverge from the Daily P&L card.
+          const ipsaDates = ipsaHistory.map(d => d.date);
+          weightedTickers.forEach(({ ticker }) => {
+            if (Object.keys(priceMaps[ticker]).length < 5) {
+              const pos = positions.find(p => p.ticker === ticker);
+              const changePct = pos?.quote?.regularMarketChangePercent;
+              const prevClose = pos?.quote?.regularMarketPreviousClose;
+              if (changePct != null && prevClose != null && ipsaDates.length > 0) {
+                ipsaDates.forEach((date, i) => {
+                  priceMaps[ticker][date] = prevClose * (1 + (changePct / 100) * (i + 1) / ipsaDates.length);
+                });
+              }
+            }
           });
         }
 

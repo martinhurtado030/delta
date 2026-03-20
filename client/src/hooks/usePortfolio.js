@@ -1,30 +1,133 @@
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useEffect, useCallback, useMemo } from 'react';
 import { fetchQuotes } from '../utils/api';
 
 const STORAGE_KEY = 'delta_portfolios_v1';
 const LEGACY_KEY  = 'delta_portfolio_v2';
 
+// ── Core logic ─────────────────────────────────────────────────────────────────
+
+// Derive remaining BUY lots from transaction history using FIFO.
+// This is the single source of truth for "what shares do I hold and how much".
+function derivePositions(transactions) {
+  const buys = transactions
+    .filter(t => t.type === 'BUY')
+    .sort((a, b) => new Date(a.date) - new Date(b.date))
+    .map(t => ({ ...t, remaining: t.quantity }));
+
+  const sells = transactions
+    .filter(t => t.type === 'SELL')
+    .sort((a, b) => new Date(a.date) - new Date(b.date));
+
+  for (const sell of sells) {
+    let toSell = sell.quantity;
+    for (const lot of buys.filter(b => b.ticker === sell.ticker)) {
+      if (toSell <= 0) break;
+      const consumed = Math.min(lot.remaining, toSell);
+      lot.remaining -= consumed;
+      toSell -= consumed;
+    }
+  }
+
+  return buys
+    .filter(b => b.remaining > 0)
+    .map(b => ({
+      id:       b.id,
+      ticker:   b.ticker,
+      name:     b.name   || b.ticker,
+      sector:   b.sector || 'Unknown',
+      quantity: b.remaining,
+      buyPrice: b.price,
+      buyDate:  b.date,
+      currency: b.currency || 'CLP',
+    }));
+}
+
+// Compute realized P&L for a SELL using FIFO cost basis.
+// Used when editing a SELL transaction so the stored value stays accurate.
+function computeRealizedPnL(transactions, sellTxId, qty, price, date, ticker) {
+  const buys = transactions
+    .filter(t => t.type === 'BUY' && t.ticker === ticker)
+    .sort((a, b) => new Date(a.date) - new Date(b.date))
+    .map(t => ({ ...t, remaining: t.quantity }));
+
+  // Consume shares from prior SELL transactions (excluding the one being edited)
+  transactions
+    .filter(t => t.type === 'SELL' && t.ticker === ticker && t.id !== sellTxId && new Date(t.date) <= new Date(date))
+    .sort((a, b) => new Date(a.date) - new Date(b.date))
+    .forEach(s => {
+      let toSell = s.quantity;
+      for (const lot of buys) {
+        if (toSell <= 0) break;
+        const consumed = Math.min(lot.remaining, toSell);
+        lot.remaining -= consumed;
+        toSell -= consumed;
+      }
+    });
+
+  let remaining = qty;
+  let cost = 0;
+  for (const lot of buys) {
+    if (remaining <= 0) break;
+    if (lot.remaining <= 0) continue;
+    const consumed = Math.min(lot.remaining, remaining);
+    cost += consumed * lot.price;
+    remaining -= consumed;
+  }
+
+  return qty * price - cost;
+}
+
+// ── Storage ────────────────────────────────────────────────────────────────────
+
 const emptyPortfolio = (id, name) => ({
   id,
   name,
-  positions:    [],
-  cashReserve:  0,
   transactions: [],
+  cashReserve:  0,
   dividends:    [],
 });
+
+// Old format stored a separate `positions` array alongside `transactions`.
+// BUY transactions lacked name/sector/currency — copy them in from positions, then drop positions.
+function migratePortfolio(p) {
+  if (!p.positions) return p;
+  const posMap = {};
+  p.positions.forEach(pos => { posMap[pos.id] = pos; });
+  const transactions = (p.transactions || []).map(t => {
+    if (t.type === 'BUY' && posMap[t.id]) {
+      const pos = posMap[t.id];
+      return { ...t, name: pos.name, sector: pos.sector, currency: pos.currency || 'CLP' };
+    }
+    return t;
+  });
+  const { positions: _dropped, ...rest } = p;
+  return { ...rest, transactions };
+}
 
 function loadFromStorage() {
   try {
     const raw = localStorage.getItem(STORAGE_KEY);
-    if (raw) return JSON.parse(raw);
+    if (raw) {
+      const parsed = JSON.parse(raw);
+      const needsMigration = Object.values(parsed.portfolios).some(p => p.positions);
+      if (needsMigration) {
+        const migrated = {
+          ...parsed,
+          portfolios: Object.fromEntries(
+            Object.entries(parsed.portfolios).map(([id, p]) => [id, migratePortfolio(p)])
+          ),
+        };
+        localStorage.setItem(STORAGE_KEY, JSON.stringify(migrated));
+        return migrated;
+      }
+      return parsed;
+    }
     // Migrate from legacy single-portfolio format
     const legacy = localStorage.getItem(LEGACY_KEY);
     if (legacy) {
       const d = JSON.parse(legacy);
-      const migrated = {
-        activeId: 'p1',
-        portfolios: { p1: { id: 'p1', name: 'Principal', ...d } },
-      };
+      const p1 = migratePortfolio({ id: 'p1', name: 'Principal', ...d });
+      const migrated = { activeId: 'p1', portfolios: { p1 } };
       localStorage.setItem(STORAGE_KEY, JSON.stringify(migrated));
       return migrated;
     }
@@ -36,52 +139,79 @@ function saveToStorage(state) {
   try { localStorage.setItem(STORAGE_KEY, JSON.stringify(state)); } catch (_) {}
 }
 
+// ── Hook ───────────────────────────────────────────────────────────────────────
+
 export function usePortfolio() {
   const [state,       setState]       = useState(loadFromStorage);
   const [quotes,      setQuotes]      = useState({});
   const [loading,     setLoading]     = useState(false);
   const [lastUpdated, setLastUpdated] = useState(null);
 
-  const portfolio = state.portfolios[state.activeId] ?? emptyPortfolio(state.activeId ?? 'p1', 'Portafolio');
+  // `portfolio` is the stored data + positions derived from transactions.
+  // Only the stored fields (transactions, cashReserve, dividends) are persisted.
+  const rawPortfolio    = state.portfolios[state.activeId] ?? emptyPortfolio(state.activeId ?? 'p1', 'Portafolio');
+  // Memoize so positions array reference is stable between renders — prevents
+  // downstream useMemo/useEffect hooks from firing on every quote refresh.
+  const derivedPositions = useMemo(() => derivePositions(rawPortfolio.transactions), [rawPortfolio.transactions]);
+  const portfolio        = { ...rawPortfolio, positions: derivedPositions };
 
-  const persist = useCallback((next) => {
-    const resolved = typeof next === 'function' ? next(state) : next;
-    setState(resolved);
-    saveToStorage(resolved);
-  }, [state]);
+  // Central updater — always reads fresh state via the functional setState form,
+  // so no mutation can ever close over a stale portfolio snapshot.
+  const updateActivePortfolio = useCallback((updater) => {
+    setState(s => {
+      const current = s.portfolios[s.activeId] ?? emptyPortfolio(s.activeId, 'Portafolio');
+      const updated = typeof updater === 'function' ? updater(current) : updater;
+      const next    = { ...s, portfolios: { ...s.portfolios, [s.activeId]: updated } };
+      saveToStorage(next);
+      return next;
+    });
+  }, []);
 
-  // ── Portfolio management ──────────────────────────────────────────────────────
+  // ── Portfolio management ───────────────────────────────────────────────────
 
   const createPortfolio = useCallback((name) => {
     const id = `p${Date.now()}`;
-    persist(s => ({
-      ...s,
-      activeId: id,
-      portfolios: { ...s.portfolios, [id]: emptyPortfolio(id, name.trim() || 'Nuevo Portafolio') },
-    }));
-  }, [persist]);
+    setState(s => {
+      const next = {
+        ...s,
+        activeId:   id,
+        portfolios: { ...s.portfolios, [id]: emptyPortfolio(id, name.trim() || 'Nuevo Portafolio') },
+      };
+      saveToStorage(next);
+      return next;
+    });
+  }, []);
 
   const switchPortfolio = useCallback((id) => {
-    persist(s => s.portfolios[id] ? { ...s, activeId: id } : s);
-  }, [persist]);
+    setState(s => {
+      if (!s.portfolios[id]) return s;
+      const next = { ...s, activeId: id };
+      saveToStorage(next);
+      return next;
+    });
+  }, []);
 
   const renamePortfolio = useCallback((id, name) => {
-    persist(s => {
+    setState(s => {
       if (!s.portfolios[id]) return s;
-      return { ...s, portfolios: { ...s.portfolios, [id]: { ...s.portfolios[id], name: name.trim() } } };
+      const next = { ...s, portfolios: { ...s.portfolios, [id]: { ...s.portfolios[id], name: name.trim() } } };
+      saveToStorage(next);
+      return next;
     });
-  }, [persist]);
+  }, []);
 
   const deletePortfolio = useCallback((id) => {
-    persist(s => {
+    setState(s => {
       if (Object.keys(s.portfolios).length <= 1) return s;
       const { [id]: _, ...rest } = s.portfolios;
       const nextActive = s.activeId === id ? Object.keys(rest)[0] : s.activeId;
-      return { ...s, activeId: nextActive, portfolios: rest };
+      const next = { ...s, activeId: nextActive, portfolios: rest };
+      saveToStorage(next);
+      return next;
     });
-  }, [persist]);
+  }, []);
 
-  // ── Quotes ────────────────────────────────────────────────────────────────────
+  // ── Quotes ─────────────────────────────────────────────────────────────────
 
   const refreshQuotes = useCallback(async () => {
     if (portfolio.positions.length === 0) {
@@ -91,8 +221,8 @@ export function usePortfolio() {
     setLoading(true);
     try {
       const symbols = [...new Set(portfolio.positions.map(p => p.ticker))];
-      const data = await fetchQuotes(symbols);
-      const map = {};
+      const data    = await fetchQuotes(symbols);
+      const map     = {};
       data.forEach(q => { map[q.symbol] = q; });
       setQuotes(map);
       setLastUpdated(new Date());
@@ -113,181 +243,94 @@ export function usePortfolio() {
     return () => clearInterval(interval);
   }, [refreshQuotes]);
 
-  // ── Position operations ───────────────────────────────────────────────────────
+  // ── Position operations ────────────────────────────────────────────────────
 
   const addPosition = useCallback((position) => {
-    const newPosition = {
-      id:       Date.now().toString(),
-      ticker:   position.ticker,
-      name:     position.name,
-      sector:   position.sector,
-      quantity: parseFloat(position.quantity),
-      buyPrice: parseFloat(position.buyPrice),
-      buyDate:  position.buyDate || new Date().toISOString().split('T')[0],
-      currency: 'CLP',
+    const id    = Date.now().toString();
+    const qty   = parseFloat(position.quantity);
+    const price = parseFloat(position.buyPrice);
+    const date  = position.buyDate || new Date().toISOString().split('T')[0];
+    const buyTx = {
+      id, type: 'BUY',
+      ticker: position.ticker, name: position.name, sector: position.sector,
+      quantity: qty, price, total: qty * price, date, currency: 'CLP',
     };
-    const transaction = {
-      id: newPosition.id, type: 'BUY',
-      ticker: position.ticker, quantity: newPosition.quantity,
-      price: newPosition.buyPrice, total: newPosition.quantity * newPosition.buyPrice,
-      date: newPosition.buyDate,
-    };
-    persist(s => ({
-      ...s,
-      portfolios: {
-        ...s.portfolios,
-        [s.activeId]: {
-          ...portfolio,
-          positions:    [...portfolio.positions, newPosition],
-          transactions: [...portfolio.transactions, transaction],
-        },
-      },
-    }));
-  }, [portfolio, persist]);
+    updateActivePortfolio(p => ({ ...p, transactions: [...p.transactions, buyTx] }));
+  }, [updateActivePortfolio]);
 
   const sellPosition = useCallback(({ ticker, quantity, price, date, total, realizedPnL }) => {
-    const lots = portfolio.positions
-      .filter(p => p.ticker === ticker)
-      .sort((a, b) => new Date(a.buyDate) - new Date(b.buyDate));
-    if (!lots.length) return;
-
-    const transaction = {
+    const sellTx = {
       id: Date.now().toString(), type: 'SELL',
       ticker, quantity, price, total, realizedPnL, date,
     };
-
-    let remaining = quantity;
-    const newPositions = [...portfolio.positions];
-    for (const lot of lots) {
-      if (remaining <= 0) break;
-      const idx = newPositions.findIndex(p => p.id === lot.id);
-      if (remaining >= lot.quantity) {
-        newPositions.splice(idx, 1);
-        remaining -= lot.quantity;
-      } else {
-        newPositions[idx] = { ...newPositions[idx], quantity: lot.quantity - remaining };
-        remaining = 0;
-      }
-    }
-    persist(s => ({
-      ...s,
-      portfolios: {
-        ...s.portfolios,
-        [s.activeId]: {
-          ...portfolio,
-          positions:    newPositions,
-          transactions: [...portfolio.transactions, transaction],
-        },
-      },
-    }));
-  }, [portfolio, persist]);
+    updateActivePortfolio(p => ({ ...p, transactions: [...p.transactions, sellTx] }));
+  }, [updateActivePortfolio]);
 
   const removeByTicker = useCallback((ticker) => {
-    const toRemove = portfolio.positions.filter(p => p.ticker === ticker);
-    if (!toRemove.length) return;
-    const newTxs = toRemove.map(pos => {
-      const currentPrice = quotes[pos.ticker]?.regularMarketPrice ?? pos.buyPrice;
-      return {
-        id: Date.now().toString() + Math.random(), type: 'SELL', ticker: pos.ticker,
-        quantity: pos.quantity, price: currentPrice,
-        total: pos.quantity * currentPrice, realizedPnL: pos.quantity * (currentPrice - pos.buyPrice),
-        date: new Date().toISOString().split('T')[0],
-      };
+    updateActivePortfolio(p => {
+      const lotsToRemove = derivePositions(p.transactions).filter(pos => pos.ticker === ticker);
+      if (!lotsToRemove.length) return p;
+      const sellTxs = lotsToRemove.map(pos => {
+        const currentPrice = quotes[pos.ticker]?.regularMarketPrice ?? pos.buyPrice;
+        return {
+          id: Date.now().toString() + Math.random(), type: 'SELL', ticker: pos.ticker,
+          quantity: pos.quantity, price: currentPrice,
+          total: pos.quantity * currentPrice,
+          realizedPnL: pos.quantity * (currentPrice - pos.buyPrice),
+          date: new Date().toISOString().split('T')[0],
+        };
+      });
+      return { ...p, transactions: [...p.transactions, ...sellTxs] };
     });
-    persist(s => ({
-      ...s,
-      portfolios: {
-        ...s.portfolios,
-        [s.activeId]: {
-          ...portfolio,
-          positions:    portfolio.positions.filter(p => p.ticker !== ticker),
-          transactions: [...portfolio.transactions, ...newTxs],
-        },
-      },
-    }));
-  }, [portfolio, quotes, persist]);
+  }, [updateActivePortfolio, quotes]);
 
+  // Edit a transaction. For SELL transactions, realizedPnL is recomputed from
+  // the actual FIFO cost basis so it stays accurate after qty/price/date changes.
   const editTransaction = useCallback((transactionId, updates) => {
-    const tx = portfolio.transactions.find(t => t.id === transactionId);
-    if (!tx) return;
-    const qty   = updates.quantity != null ? parseFloat(updates.quantity) : tx.quantity;
-    const price = updates.price    != null ? parseFloat(updates.price)    : tx.price;
-    const date  = updates.date     != null ? updates.date                 : tx.date;
-    let updatedRealizedPnL = tx.realizedPnL;
-    if (tx.type === 'SELL' && tx.realizedPnL != null) {
-      const costPerShare = (tx.total - tx.realizedPnL) / tx.quantity;
-      updatedRealizedPnL = qty * price - qty * costPerShare;
-    }
-    const newTransactions = portfolio.transactions.map(t =>
-      t.id === transactionId
-        ? { ...t, quantity: qty, price, date, total: qty * price, realizedPnL: updatedRealizedPnL }
-        : t
-    );
-    let newPositions = portfolio.positions;
-    if (tx.type === 'BUY') {
-      newPositions = portfolio.positions.map(p =>
-        p.id === transactionId ? { ...p, quantity: qty, buyPrice: price, buyDate: date } : p
-      );
-    }
-    persist(s => ({
-      ...s,
-      portfolios: {
-        ...s.portfolios,
-        [s.activeId]: { ...portfolio, transactions: newTransactions, positions: newPositions },
-      },
-    }));
-  }, [portfolio, persist]);
+    updateActivePortfolio(p => {
+      const tx = p.transactions.find(t => t.id === transactionId);
+      if (!tx) return p;
+      const qty   = updates.quantity != null ? parseFloat(updates.quantity) : tx.quantity;
+      const price = updates.price    != null ? parseFloat(updates.price)    : tx.price;
+      const date  = updates.date     != null ? updates.date                 : tx.date;
+      let updatedTx = { ...tx, quantity: qty, price, date, total: qty * price };
+      if (tx.type === 'SELL') {
+        updatedTx.realizedPnL = computeRealizedPnL(p.transactions, transactionId, qty, price, date, tx.ticker);
+      }
+      return { ...p, transactions: p.transactions.map(t => t.id === transactionId ? updatedTx : t) };
+    });
+  }, [updateActivePortfolio]);
 
+  // Deleting any transaction is safe: positions are always re-derived from the
+  // remaining transactions, so deleting a SELL automatically restores the lots.
   const deleteTransaction = useCallback((transactionId) => {
-    const tx = portfolio.transactions.find(t => t.id === transactionId);
-    if (!tx) return;
-    const newTransactions = portfolio.transactions.filter(t => t.id !== transactionId);
-    const newPositions = tx.type === 'BUY'
-      ? portfolio.positions.filter(p => p.id !== transactionId)
-      : portfolio.positions;
-    persist(s => ({
-      ...s,
-      portfolios: {
-        ...s.portfolios,
-        [s.activeId]: { ...portfolio, transactions: newTransactions, positions: newPositions },
-      },
+    updateActivePortfolio(p => ({
+      ...p, transactions: p.transactions.filter(t => t.id !== transactionId),
     }));
-  }, [portfolio, persist]);
+  }, [updateActivePortfolio]);
 
   const updateCash = useCallback((amount) => {
-    persist(s => ({
-      ...s,
-      portfolios: {
-        ...s.portfolios,
-        [s.activeId]: { ...portfolio, cashReserve: parseFloat(amount) || 0 },
-      },
-    }));
-  }, [portfolio, persist]);
+    updateActivePortfolio(p => ({ ...p, cashReserve: parseFloat(amount) || 0 }));
+  }, [updateActivePortfolio]);
 
   const addDividend = useCallback((dividend) => {
-    persist(s => ({
-      ...s,
-      portfolios: {
-        ...s.portfolios,
-        [s.activeId]: {
-          ...portfolio,
-          dividends:   [...portfolio.dividends, { id: Date.now().toString(), ...dividend, date: dividend.date || new Date().toISOString().split('T')[0] }],
-          cashReserve: portfolio.cashReserve + parseFloat(dividend.amount),
-        },
-      },
+    updateActivePortfolio(p => ({
+      ...p,
+      dividends:    [...p.dividends, { id: Date.now().toString(), ...dividend, date: dividend.date || new Date().toISOString().split('T')[0] }],
+      cashReserve:  p.cashReserve + parseFloat(dividend.amount),
     }));
-  }, [portfolio, persist]);
+  }, [updateActivePortfolio]);
 
-  // ── Computed metrics ──────────────────────────────────────────────────────────
+  // ── Computed metrics ───────────────────────────────────────────────────────
 
   const metrics = (() => {
     let equityValue = 0;
     let totalCost   = 0;
     const positionsWithData = portfolio.positions.map(pos => {
-      const quote        = quotes[pos.ticker];
-      const currentPrice = quote?.regularMarketPrice ?? null;
-      const currentValue = currentPrice != null ? pos.quantity * currentPrice : null;
-      const costBasis    = pos.quantity * pos.buyPrice;
+      const quote            = quotes[pos.ticker];
+      const currentPrice     = quote?.regularMarketPrice ?? null;
+      const currentValue     = currentPrice != null ? pos.quantity * currentPrice : null;
+      const costBasis        = pos.quantity * pos.buyPrice;
       const unrealizedPnL    = currentValue != null ? currentValue - costBasis : null;
       const unrealizedPnLPct = costBasis > 0 && unrealizedPnL != null ? (unrealizedPnL / costBasis) * 100 : null;
       if (currentValue != null) equityValue += currentValue;

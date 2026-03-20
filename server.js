@@ -1,3 +1,6 @@
+// Operating mode: local-first.
+// Portfolio data lives in the client's localStorage.
+// Auth and database modules are paused — see _paused/ for those files.
 import express from 'express';
 import cors from 'cors';
 import NodeCache from 'node-cache';

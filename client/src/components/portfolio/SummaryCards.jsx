@@ -24,7 +24,7 @@ export default function SummaryCards({ metrics }) {
   if (!metrics) return null;
 
   return (
-    <div style={{ display: 'flex', gap: 16, flexWrap: 'wrap', marginBottom: 24 }}>
+    <div className="summary-cards" style={{ display: 'flex', gap: 16, flexWrap: 'wrap', marginBottom: 24 }}>
       <Card
         label="NAV Total"
         value={fmt.compact(metrics.totalNav) + ' CLP'}

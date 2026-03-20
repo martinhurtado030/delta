@@ -43,7 +43,7 @@ export default function Header({
   return (
     <header style={{ background: '#0a0f1c', borderBottom: '1px solid #1e2d45', position: 'sticky', top: 0, zIndex: 100 }}>
       <div style={{ maxWidth: 1400, margin: '0 auto', padding: '0 24px' }}>
-        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', height: 60 }}>
+        <div className="header-inner" style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', height: 60 }}>
 
           {/* Logo */}
           <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
@@ -56,7 +56,7 @@ export default function Header({
 
           {/* Nav + Portfolio selector */}
           <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-            <nav style={{ display: 'flex', gap: 4 }}>
+            <nav className="header-nav-scroll" style={{ display: 'flex', gap: 4 }}>
               {NAV_TABS.map(tab => (
                 <button
                   key={tab}
@@ -188,7 +188,7 @@ export default function Header({
           </div>
 
           {/* Quick Stats */}
-          <div style={{ display: 'flex', gap: 24, alignItems: 'center' }}>
+          <div className="header-quickstats" style={{ display: 'flex', gap: 24, alignItems: 'center' }}>
             {metrics && (
               <>
                 <div style={{ textAlign: 'right' }}>

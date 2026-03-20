@@ -151,13 +151,32 @@ All charts support: `1D (5m)`, `1S (5d/1h)`, `1M (1mo/1d)`, `3M`, `6M`, `1A`, `2
 | News feed — orden incorrecto | `parseRSS` formateaba la fecha a `toLocaleDateString('es-CL')` antes de guardar; el sort posterior no podía parsear ese formato. Fix: guardar `rawDate` (timestamp numérico) junto a `date` (formateada), ordenar por `rawDate`. |
 | MarketHeatmap crash al navegar a Mercado | Recharts Treemap llama `content` también para el nodo raíz (depth=0) con props undefined. Fix: guardar con `if (depth === 0 || x == null || !width || !height || width < 30 || height < 20) return null` en CustomContent. También remover props inválidos `stroke`/`strokeWidth` del Treemap y agregar `isAnimationActive={false}`. |
 | usePortfolio — dos intervalos de polling | Refactor multi-portafolio dejó dos `useEffect` con `setInterval(refreshQuotes, 60000)`. Fix: separar en un efecto que limpia quotes al cambiar `activeId` y otro que maneja el polling, dependiente solo de `refreshQuotes`. |
+| deleteTransaction SELL no restauraba posiciones | Al borrar una SELL, las acciones consumidas no volvían al portafolio. Fix: eliminar array `positions` del storage y derivar posiciones desde transacciones con `derivePositions()` — borrar una SELL automáticamente restaura los lotes. |
+| Stale closures en mutaciones de portafolio | Mutaciones como `addPosition`/`sellPosition` cerraban sobre `portfolio` (snapshot stale). Si dos mutaciones ocurrían juntas, la segunda podía sobrescribir la primera. Fix: `updateActivePortfolio(updater)` usa el form funcional de `setState` — siempre lee estado fresco. |
+| editTransaction SELL calculaba realizedPnL desde datos almacenados | `costPerShare` se derivaba del propio tx almacenado, que podía ser incorrecto. Fix: `computeRealizedPnL()` recalcula desde el historial FIFO real de transacciones. |
 
 ## Multi-Portafolio
 - Storage key: `delta_portfolios_v1` (migra automáticamente desde `delta_portfolio_v2`)
-- Formato: `{ activeId: string, portfolios: { [id]: { id, name, positions, cashReserve, transactions, dividends } } }`
+- Formato almacenado: `{ activeId: string, portfolios: { [id]: { id, name, transactions, cashReserve, dividends } } }`
+- **`positions` no se almacena** — se deriva en tiempo de ejecución a partir de `transactions` vía FIFO (`derivePositions()`)
 - `usePortfolio.js` expone: `portfolioList`, `activePortfolioId`, `createPortfolio`, `switchPortfolio`, `renamePortfolio`, `deletePortfolio`
 - UI: dropdown en Header con nombre del portafolio activo, crear/renombrar/eliminar inline
 - Al cambiar de portafolio: se limpian quotes y se re-fetchean para el portafolio activo
+
+## usePortfolio.js — Arquitectura interna
+El hook usa dos funciones puras como núcleo del motor de portafolio:
+
+### `derivePositions(transactions)`
+Reproduce todas las transacciones BUY/SELL en orden cronológico (FIFO) y retorna los lotes restantes como array de posiciones. Es la única fuente de verdad para "qué acciones tengo y a qué precio". Elimina la necesidad de mantener `positions` sincronizado manualmente.
+
+### `computeRealizedPnL(transactions, sellTxId, qty, price, date, ticker)`
+Calcula el P&L realizado de una venta usando el costo FIFO real (consumiendo prior SELLs del mismo ticker, excluyendo el propio). Usado en `editTransaction` para mantener `realizedPnL` preciso tras ediciones.
+
+### `updateActivePortfolio(updater)`
+Actualizador central que siempre lee el estado fresco vía el form funcional de `setState`. Todas las mutaciones (add, sell, edit, delete) pasan por aquí — ninguna puede cerrar sobre un snapshot stale.
+
+### Migración automática de formato antiguo
+Si al cargar se detecta `positions` en el storage (formato anterior), `migratePortfolio()` enriquece las transacciones BUY con `name/sector/currency` (que antes no tenían) y descarta `positions`. La migración ocurre una vez y se guarda.
 
 ## Heatmap del Mercado (`MarketHeatmap.jsx`)
 - Endpoint: `GET /api/heatmap` — reusa cache de quotes IPSA + `IPSA_META` dict en server.js (nombre + sector por ticker)
@@ -215,6 +234,23 @@ Labels in UI update dynamically to show the actual period used.
 - [x] Heatmap del Mercado (MarketHeatmap.jsx) — Recharts Treemap, tamaño=market cap, color=variación, filtro por sector
 - [x] Métricas de Riesgo en fundamentales — Beta vs IPSA, Volatilidad anual, Sharpe Ratio calculados desde historial 1A
 - [x] Multi-portafolio — crear/cambiar/renombrar/eliminar portafolios, migración automática desde formato anterior
+- [x] usePortfolio refactor — posiciones derivadas de transacciones (FIFO), sin stale closures, deleteTransaction SELL restaura lotes automáticamente
+- [x] Mobile responsive layout — nav scrollable, quick stats hidden, summary cards 2-col grid, dashboard grids single-column, reduced padding
+
+## Responsive Layout (Mobile)
+Breakpoint: `≤768px` via media queries in `client/src/index.css`.
+
+| CSS class | Used in | Mobile behavior |
+|-----------|---------|-----------------|
+| `.header-inner` | `Header.jsx` | Wraps to two rows (logo row + nav row) |
+| `.header-nav-scroll` | `Header.jsx` `<nav>` | Horizontally scrollable, scrollbar hidden |
+| `.header-quickstats` | `Header.jsx` quick stats section | `display: none` — values visible in cards |
+| `.main-content` | `App.jsx` `<main>` | Padding reduced to `16px 12px` |
+| `.action-bar` | `App.jsx` title/button bar | `flex-wrap: wrap` — button drops below title |
+| `.grid-cols-2` | `App.jsx` dashboard grids | `1fr` single column (desktop: `1fr 1fr`) |
+| `.summary-cards` | `SummaryCards.jsx` | `display: grid; grid-template-columns: 1fr 1fr` |
+
+Desktop layout (>768px) is completely unchanged.
 
 ## Potential Future Improvements
 - [ ] Persistent backend cache (Redis or SQLite) to survive restarts
@@ -238,12 +274,12 @@ Labels in UI update dynamically to show the actual period used.
 ## Deploy Guide (Render + Vercel)
 
 ### Contexto
-El código corre actualmente **solo local con localStorage** (sin auth, sin DB).
-Los archivos del sistema de deploy YA EXISTEN en el repo pero están desconectados:
-- `server/auth.js` — registro/login con JWT + bcrypt
-- `server/db.js` — conexión PostgreSQL (Supabase)
-- `client/src/components/auth/LoginPage.jsx` — UI de login/registro
-- `client/src/context/AuthContext.jsx` — contexto de autenticación
+El código corre actualmente **solo local con localStorage** (sin auth, sin DB). Modo activo: **local-first**.
+Los archivos del sistema de deploy están pausados en `_paused/`:
+- `_paused/server/auth.js` — registro/login con JWT + bcrypt
+- `_paused/server/db.js` — conexión PostgreSQL (Supabase)
+- `_paused/client/LoginPage.jsx` — UI de login/registro
+- `_paused/client/AuthContext.jsx` — contexto de autenticación
 - `nixpacks.toml` — config para que Render instale Python + Node juntos
 - `render.yaml` — config del servicio en Render
 
@@ -290,7 +326,7 @@ const hash = await bcrypt.hash(password, 10);  // era 12, bajar a 10
 ⚠️ Los usuarios registrados con 12 rounds seguirán funcionando (bcrypt.compare detecta los rounds del hash automáticamente). Solo los nuevos registros usarán 10 rounds.
 
 #### PASO 3 — Reconectar server.js
-Agregar imports al inicio:
+Agregar imports al inicio (mover archivos de `_paused/server/` a `server/` primero):
 ```js
 import { initDB, query } from './server/db.js';
 import { register, login, requireAuth } from './server/auth.js';
@@ -368,14 +404,14 @@ export const portfolioCreate  = (id, name) => api.post('/portfolio', { id, name 
 export const portfolioDelete  = (id) => api.delete(`/portfolio/${id}`).then(r => r.data);
 ```
 
-**`client/src/main.jsx`** — envolver con AuthProvider:
+**`client/src/main.jsx`** — envolver con AuthProvider (mover `_paused/client/AuthContext.jsx` → `client/src/context/AuthContext.jsx` primero):
 ```jsx
 import { AuthProvider } from './context/AuthContext.jsx';
 // ...
 <AuthProvider><App /></AuthProvider>
 ```
 
-**`client/src/App.jsx`** — agregar gate de login:
+**`client/src/App.jsx`** — agregar gate de login (mover `_paused/client/LoginPage.jsx` → `client/src/components/auth/LoginPage.jsx` primero):
 ```jsx
 import { useAuth } from './context/AuthContext.jsx';
 import LoginPage from './components/auth/LoginPage.jsx';
